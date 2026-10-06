@@ -48,6 +48,33 @@ function visibleLength(text: string): number {
 }
 
 /**
+ * C0/C1 controls (ESC included) minus tab and newline. Mirrors the host's
+ * `sanitizeText` (`@oh-my-pi/pi-utils`): tab and newline are structure the card
+ * re-wraps itself, everything else a terminal would interpret is dropped.
+ */
+const TERMINAL_CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/g;
+
+/**
+ * Strip terminal control sequences from untrusted text: the model's intent /
+ * jobId / cwd, command output, script errors.
+ *
+ * The card is this tool's only sanitization point. The host renders custom
+ * renderer rows verbatim (`SafeToolRendererComponent.render` returns them
+ * unchanged, `chat/tool-execution.ts`), so an OSC 52 clipboard sequence in a
+ * job's output would otherwise be written straight to the user's terminal.
+ *
+ * Call it on *raw* text only: the theme colors and Shiki highlights composed
+ * afterwards are ours and must survive (sanitizing a composed row would strip
+ * the card's own styling).
+ */
+function sanitizeTerminalText(text: string): string {
+  TERMINAL_CONTROL_RE.lastIndex = 0;
+  if (TERMINAL_CONTROL_RE.exec(text) === null) return text;
+  TERMINAL_CONTROL_RE.lastIndex = 0;
+  return Bun.stripANSI(text).replace(TERMINAL_CONTROL_RE, "");
+}
+
+/**
  * Slice a possibly-ANSI-colored string to `max` visible columns, preserving
  * escapes. A truncation spends one of those columns on `…`, so the result never
  * exceeds `max` — appending the ellipsis on top of a full-budget slice pushed
@@ -215,6 +242,25 @@ function frameBottom(width: number, theme: Theme): string {
   );
 }
 
+/** `╰─── status ────────────────────────╯` */
+function frameBottomWithStatus(
+  width: number,
+  theme: Theme,
+  label: string,
+): string {
+  const br = theme.boxRound;
+  const bs = theme.boxSharp;
+  const h = br?.horizontal ?? bs?.horizontal ?? "-";
+  const cornerL = br?.bottomLeft ?? "+";
+  const cornerR = br?.bottomRight ?? "+";
+  const inner = frameInnerWidth(width);
+  const shown = ansiSafeSlice(label, Math.max(1, inner - 5));
+  const fill = Math.max(0, inner - 5 - visibleLength(shown));
+  const left = theme.fg("border", `${cornerL}${h}${h}${h} `);
+  const right = theme.fg("border", `${h.repeat(fill)}${cornerR}`);
+  return `${left}${shown} ${right}`;
+}
+
 const LANG_ICON = "\u{E86C}";
 
 /** Tool label: the card's fallback title and the tool's registered `label`. */
@@ -228,50 +274,93 @@ export const TOOL_LABEL = "PowerShell 7";
  * every card both repeats itself and eats the header's width budget.
  */
 function frameTitle(theme: Theme, label: string, cwd?: string): string {
-  const body = ` ${label}${cwd ? ` · ${cwd}` : ""}`;
+  const safeLabel = sanitizeTerminalText(label);
+  const safeCwd = cwd ? sanitizeTerminalText(cwd) : "";
+  const body = ` ${safeLabel}${safeCwd ? ` · ${safeCwd}` : ""}`;
   return `${theme.fg("accent", LANG_ICON)}${theme.fg("toolTitle", body)}`;
 }
 
 /**
- * Card title text for a call: the model's intent, falling back to the tool name.
+ * One-line, control-free form of a model-authored intent.
  *
- * `i` is read from the *streamed* tool-call JSON, which can carry a non-string
- * (number/object/boolean) before schema validation — the host guards for this at
- * its own callsite. `?.` alone would throw `args.i.trim is not a function`, and a
- * throwing renderer makes the host substitute a bare label line.
- *
- * Whitespace runs collapse to one space: a model-authored intent can carry a
- * newline, and a newline inside a rendered row splits the frame in the terminal.
- * The host flattens intent text for the same reason (`renderStatusLine`).
+ * Whitespace runs collapse to one space: a newline inside a rendered row splits
+ * the frame in the terminal. Control sequences are stripped because `i` and
+ * `jobId` are model-authored, so a raw ESC here reaches the terminal unfiltered
+ * (see `sanitizeTerminalText`).
  */
-function callLabel(args: { i?: unknown }): string {
-  const intent =
-    typeof args.i === "string" ? args.i.replace(/\s+/g, " ").trim() : "";
-  return intent.length > 0 ? intent : TOOL_LABEL;
+export function oneLineIntent(intent: unknown): string {
+  return typeof intent === "string"
+    ? sanitizeTerminalText(intent).replace(/\s+/g, " ").trim()
+    : "";
 }
 
 /**
- * Intent seen while the args streamed, keyed by the host's render-state object:
- * one object per card, handed to both `renderCall` and `renderResult`
- * (`tool-execution.ts`, `#renderState`).
+ * Title text a call declares itself: the model's intent, else the job-control
+ * action, else the tool label.
  *
- * The host reconciles the args at `tool_execution_start` with the *validated*
- * object, and intent tracing strips `i` out of it (`agent-loop.ts`:
- * `extractIntent` -> `effectiveArgs` -> `event.args`). Without this memo the
- * finished card — the one the user keeps on screen — falls back to the tool
- * label while the pending row and a rebuilt transcript both show the intent.
+ * `i` comes from the *streamed* tool-call JSON, which can carry a non-string
+ * (number/object/boolean) before schema validation — the host guards for this at
+ * its own callsite. `?.` alone would throw `args.i.trim is not a function`, and a
+ * throwing renderer makes the host substitute a bare label line.
  */
-const streamedIntents = new WeakMap<object, string>();
+function callLabel(args: {
+  i?: unknown;
+  jobId?: unknown;
+  action?: unknown;
+}): string {
+  const intent = oneLineIntent(args.i);
+  if (intent.length > 0) return intent;
+  if (typeof args.jobId === "string" && args.jobId.trim().length > 0) {
+    const cleanJobId = sanitizeTerminalText(args.jobId)
+      .replace(/\s+/g, " ")
+      .trim();
+    if (args.action === "kill") return `Kill job ${cleanJobId}`;
+    if (args.action === "wait") return `Wait job ${cleanJobId}`;
+    return `Job status ${cleanJobId}`;
+  }
+  return TOOL_LABEL;
+}
 
-/** Title for one card: the args' intent while they still carry it, else the memo. */
+/**
+ * Intent seen for one call, keyed by its args object.
+ *
+ * Never keyed by the host's render-state object: an extension tool's hooks go
+ * through `RegisteredToolAdapter`, which hands `renderCall` a fresh Proxy of the
+ * render state and `renderResult` a fresh `{expanded,isPartial,spinnerFrame}`
+ * literal (`extensibility/extensions/wrapper.ts`), so that object identifies
+ * nothing across the two hooks. The args reference survives the adapter, and
+ * `tool_execution_start` hands the extension the very same object the renderers
+ * later receive (`agent-loop.ts`: `stream.push({args: effectiveArgs})` is the
+ * object `#getCallArgsForRender`/`renderResult` see) — which is what makes the
+ * intent recoverable after intent tracing stripped `i` out of the parameters
+ * (`extractIntent` -> `effectiveArgs`).
+ */
+const intentsByArgs = new WeakMap<object, string>();
+
+/** Record the intent declared for one call's args object (see `intentsByArgs`). */
+export function rememberIntent(args: unknown, intent: unknown): void {
+  const clean = oneLineIntent(intent);
+  if (clean.length === 0 || typeof args !== "object" || args === null) return;
+  intentsByArgs.set(args, clean);
+}
+
+/** Intent already recorded for one call's args object, if any. */
+function recordedIntent(args: unknown): string | undefined {
+  return typeof args === "object" && args !== null
+    ? intentsByArgs.get(args)
+    : undefined;
+}
+
+/** Title for one card: the args' own intent, else the recorded one, else the tool label. */
 export function callTitle(
-  options: PwshRenderOptions,
-  args: { i?: unknown } | undefined,
+  args: { i?: unknown; jobId?: unknown; action?: unknown } | undefined,
 ): string {
   const fromArgs = callLabel(args ?? {});
-  if (fromArgs === TOOL_LABEL) return streamedIntents.get(options) ?? TOOL_LABEL;
-  streamedIntents.set(options, fromArgs);
-  return fromArgs;
+  if (fromArgs !== TOOL_LABEL) {
+    rememberIntent(args, fromArgs);
+    return fromArgs;
+  }
+  return recordedIntent(args) ?? TOOL_LABEL;
 }
 
 /**
@@ -299,7 +388,7 @@ function pendingCallRow(theme: Theme, label: string): string {
  * re-assembling it: a missing prefix is one column of drift.
  */
 export function renderPendingRow(theme: Theme, label: string): string {
-  return ` ${pendingCallRow(theme, label)}`;
+  return ` ${pendingCallRow(theme, sanitizeTerminalText(label))}`;
 }
 
 const PREVIEW_LINES_COLLAPSED = 6;
@@ -322,6 +411,15 @@ export interface PwshRenderOptions {
   argsComplete?: boolean;
 }
 
+/**
+ * ` [jobId]` tag for a running/killed job: control-free and single-line, so a
+ * model-authored id cannot break the status row it is drawn into.
+ */
+function jobTag(jobId: string | undefined): string {
+  if (!jobId) return "";
+  return ` [${sanitizeTerminalText(jobId).replace(/\s+/g, " ").trim()}]`;
+}
+
 /** Status icon + label for the divider line (exit-code aware). */
 function renderStatusLabel(
   d: PwshDetails,
@@ -329,19 +427,28 @@ function renderStatusLabel(
   theme: Theme,
   isPartial = false,
 ): string {
+  if (d.async && d.status === "running") {
+    return `${theme.fg("accent", "●")} running${jobTag(d.jobId)}`;
+  }
+  if (d.status === "killed") {
+    return `${theme.fg("error", "◼")} killed${jobTag(d.jobId)}`;
+  }
   if (isPartial || d.streaming) {
     return `${theme.fg("accent", "●")} running · Wall: ${(d.wallTimeMs / 1000).toFixed(2)}s | Timeout: ${d.timeoutSec}s`;
   }
   const hasExitCode = d.exitCode != null && d.exitCode !== 0;
-  const bad = isError || hasExitCode;
+  const isFailed = d.status === "failed";
+  const bad = isError || hasExitCode || isFailed;
   const icon = d.dead ? "✕" : d.timedOut ? "⏱" : bad ? "✗" : "✓";
   const state = d.dead
     ? "process died"
     : d.timedOut
       ? "timed out"
-      : bad
-        ? "error"
-        : "completed";
+      : isFailed
+        ? "failed"
+        : bad
+          ? "error"
+          : "completed";
   const color = d.dead
     ? "error"
     : d.timedOut
@@ -394,11 +501,18 @@ export function commandBlock(
     formatToolWorkingDirectory(cwd, process.cwd()),
   );
   const out: string[] = [frameTop(width, theme, title)];
+  // Sanitize before highlighting: `highlightPowerShell` output carries the
+  // theme's own escape sequences, so only the raw source can be filtered.
+  const source = sanitizeTerminalText(command);
+  if (source.trim().length === 0) {
+    if (closed) out.push(frameBottom(width, theme));
+    return out;
+  }
   let lines: string[];
   try {
-    lines = highlightPowerShell(command, theme);
+    lines = highlightPowerShell(source, theme);
   } catch {
-    lines = command.split("\n");
+    lines = source.split("\n");
   }
   // A trailing newline in the submitted command is not a command line.
   while (lines.length > 1 && lines[lines.length - 1]!.trim() === "") lines.pop();
@@ -430,11 +544,11 @@ function renderBody(
   theme: Theme,
   width: number,
 ): string[] {
-  // Normalize CRLF: pwsh emits \r\n frames that would make the terminal
-  // cursor jump back to line start (blank-looking rows).
-  const body = (d.error ?? d.output ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
+  // Output and error text come from the script, not from us: strip control
+  // sequences before they reach the terminal. CR is one of them, which also
+  // disposes of the CRLF frames pwsh emits (they would otherwise make the
+  // cursor jump back to the line start and render as blank rows).
+  const body = sanitizeTerminalText(d.error ?? d.output ?? "");
   if (!body) return [];
   const maxLines = expanded ? PREVIEW_LINES_EXPANDED : PREVIEW_LINES_COLLAPSED;
   // Out-String pads leading/trailing blank lines (CRLF frames); trim both
@@ -480,35 +594,64 @@ export function renderCard(
   options: PwshRenderOptions & PwshFrameOptions & { isError?: boolean } = {},
 ): string[] {
   const expanded = options.expanded === true;
+  const statusText = renderStatusLabel(
+    details,
+    options.isError === true,
+    theme,
+    options.isPartial === true,
+  );
+  const bodyLines = renderBody(details, expanded, theme, width);
+  if (expanded && details.dead) {
+    bodyLines.push(
+      theme.fg("dim", "session reset; will be rebuilt on next call"),
+    );
+  }
+
+  const hasCommand = command.trim().length > 0;
+  const hasBody = bodyLines.length > 0;
+
+  // Case 1: No body output (e.g. async job start, silent command, or kill action)
+  // Ergonomic design: merge the status label directly into the closing bottom border!
+  // No empty space, no awkward double-border (divider immediately followed by bottom).
+  if (!hasBody) {
+    const out = commandBlock(theme, width, command, {
+      label: options.label,
+      cwd: options.cwd,
+      closed: false,
+      expanded,
+    });
+    out.push(frameBottomWithStatus(width, theme, statusText));
+    return out;
+  }
+
+  // Case 2: Has body output, but no command (e.g. inspecting job status)
+  // Ergonomic design: Top title border -> output lines -> status bottom border.
+  // No empty command row, no stacked top divider.
+  if (!hasCommand) {
+    const title = frameTitle(
+      theme,
+      options.label ?? TOOL_LABEL,
+      formatToolWorkingDirectory(options.cwd, process.cwd()),
+    );
+    const out: string[] = [frameTop(width, theme, title)];
+    for (const line of bodyLines) {
+      out.push(frameRow(line, width, theme));
+    }
+    out.push(frameBottomWithStatus(width, theme, statusText));
+    return out;
+  }
+
+  // Case 3: Classic full card (has command AND has body output)
+  // Top title border -> command rows -> status divider -> output rows -> bottom border.
   const out = commandBlock(theme, width, command, {
     label: options.label,
     cwd: options.cwd,
     closed: false,
     expanded,
   });
-  out.push(
-    frameDivider(
-      width,
-      theme,
-      renderStatusLabel(
-        details,
-        options.isError === true,
-        theme,
-        options.isPartial === true,
-      ),
-    ),
-  );
-  for (const line of renderBody(details, expanded, theme, width)) {
+  out.push(frameDivider(width, theme, statusText));
+  for (const line of bodyLines) {
     out.push(frameRow(line, width, theme));
-  }
-  if (expanded && details.dead) {
-    out.push(
-      frameRow(
-        theme.fg("dim", "session reset; will be rebuilt on next call"),
-        width,
-        theme,
-      ),
-    );
   }
   out.push(frameBottom(width, theme));
   return out;

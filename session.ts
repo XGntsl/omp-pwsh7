@@ -239,6 +239,9 @@ export class PwshSession {
     request: Omit<PwshRequest, "id">,
     options: PwshRunOptions,
   ): Promise<PwshRunResult> {
+    if (options.signal?.aborted) {
+      return { aborted: true, partialOutput: "" };
+    }
     this.start();
     if (this.#dead || !this.#proc) {
       return {
@@ -296,21 +299,21 @@ export class PwshSession {
       if (kind === "aborted")
         options.signal?.removeEventListener("abort", onAbort);
     };
+    let resolveResult = (_r: PwshRunResult): void => {};
+    const resultPromise = new Promise<PwshRunResult>((res) => {
+      resolveResult = res;
+    });
+
     const onAbort = (): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeoutTimer);
       killAndMark("aborted");
       this.#pending.delete(id);
       offExit();
       resolveResult({ aborted: true, partialOutput: this.#latestOutput });
     };
     options.signal?.addEventListener("abort", onAbort, { once: true });
-
-    let resolveResult = (_r: PwshRunResult): void => {};
-    const resultPromise = new Promise<PwshRunResult>((res) => {
-      resolveResult = res;
-    });
-
     // Timeout: kill the tree, then settle with timedOut.
     if (options.timeoutMs && options.timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
@@ -388,6 +391,12 @@ export class PwshSession {
     this.#pending.clear();
   }
 
+  /** The live pwsh process id, when this session has one running. */
+  get pid(): number | undefined {
+    const live = this.#proc;
+    return live && !live.killed ? live.pid : undefined;
+  }
+
   /** Dispose: kill the process tree and drop the session. */
   async dispose(): Promise<void> {
     const live = this.#proc;
@@ -429,6 +438,19 @@ export class PwshSessionPool {
       this.#sessions.set(key, session);
     }
     return session;
+  }
+  dispose(key: string): void {
+    const s = this.#sessions.get(key);
+    if (s) {
+      this.#sessions.delete(key);
+      void s.dispose();
+    }
+  }
+
+  /** Live pids for a pooled session, for job inspectors (empty once it is gone). */
+  pidFor(key: string): readonly number[] {
+    const pid = this.#sessions.get(key)?.pid;
+    return pid == null ? [] : [pid];
   }
 
   disposeAll(): void {

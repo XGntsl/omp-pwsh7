@@ -142,6 +142,29 @@ test("schema accepts async, jobId, and action parameters", () => {
   expect(shape.async).toBeDefined();
   expect(shape.jobId).toBeDefined();
   expect(shape.action).toBeDefined();
+  expect(shape.restart).toBeDefined();
+});
+
+test("rejects restart combined with job parameters", async () => {
+  const { tool } = makeTool();
+
+  const withAsync = await tool.execute(
+    "call_restart_async",
+    { command: "Write-Output 'x'", restart: true, async: true },
+    undefined,
+    undefined,
+  );
+  expect(withAsync.isError).toBe(true);
+  expect(withAsync.content[0]?.text).toContain("cannot be combined");
+
+  const withJobId = await tool.execute(
+    "call_restart_job",
+    { restart: true, jobId: "job_1", action: "kill" },
+    undefined,
+    undefined,
+  );
+  expect(withJobId.isError).toBe(true);
+  expect(withJobId.content[0]?.text).toContain("cannot be combined");
 });
 
 test("starts an async job immediately without blocking and delivers result via sendMessage", async () => {

@@ -37,6 +37,9 @@ const DEFAULT_FORK = process.env.OMP_KOUHE3_DIR ?? "C:/tmp/omp-kouhe3";
 /** Package inside the fork that holds the extension-facing types. */
 const PACKAGE_DIR = "packages/coding-agent";
 
+/** Expected `name` of the manifest this script rewrites; ownership evidence for `--fork`. */
+const FORK_PACKAGE_NAME = "@oh-my-pi/pi-coding-agent";
+
 /** Manifest key/value types we repoint from `./src/*.ts` to `./dist/types/*.d.ts`. */
 interface PackManifest {
 	name?: string;
@@ -62,17 +65,49 @@ function toDeclarationPath(spec: string): string {
 	return `./dist/types/${relative}.d.ts`;
 }
 
+/**
+ * `--vendor` names the directory this script deletes recursively, so pin it
+ * before anything is touched: it must sit strictly inside the extension root and,
+ * when it already exists, be a directory. A typo (`--vendor C:/`) fails loud
+ * instead of removing an unrelated tree.
+ */
+async function assertDeletableVendorDir(
+	extensionRoot: string,
+	vendorDir: string,
+): Promise<void> {
+	const rel = path.relative(extensionRoot, vendorDir);
+	if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+		throw new Error(
+			`--vendor must be a path strictly inside ${extensionRoot} (got ${vendorDir}); refusing to delete it.`,
+		);
+	}
+	const stat = await fs.stat(vendorDir).catch(() => null);
+	if (stat && !stat.isDirectory()) {
+		throw new Error(
+			`--vendor must name a directory (got ${vendorDir}); refusing to delete it.`,
+		);
+	}
+}
+
 async function main(): Promise<void> {
 	const fork = argValue("--fork") ?? DEFAULT_FORK;
 	const extensionRoot = path.resolve(import.meta.dir, "..");
 	const vendorArg = argValue("--vendor");
 	const vendorDir = vendorArg ? path.resolve(vendorArg) : path.join(extensionRoot, "vendor");
+	await assertDeletableVendorDir(extensionRoot, vendorDir);
 	const packageDir = path.join(fork, PACKAGE_DIR);
 	const manifestPath = path.join(packageDir, "package.json");
 
 	const original = await fs.readFile(manifestPath, "utf8");
 	// Named cast: this path is our own fork checkout's manifest, not external input.
 	const sourceManifest = JSON.parse(original) as PackManifest;
+	// Ownership evidence before the rewrite below: a typo'd `--fork` /
+	// OMP_KOUHE3_DIR must not overwrite an unrelated package's manifest.
+	if (sourceManifest.name !== FORK_PACKAGE_NAME) {
+		throw new Error(
+			`${manifestPath} is not ${FORK_PACKAGE_NAME} (name=${sourceManifest.name ?? "<none>"}); check --fork / OMP_KOUHE3_DIR.`,
+		);
+	}
 	const version = sourceManifest.version ?? "0.0.0";
 	// Keyed on the package subtree, not HEAD: a root-level docs commit must not
 	// rename the tarball (and churn the devDependency specifier).

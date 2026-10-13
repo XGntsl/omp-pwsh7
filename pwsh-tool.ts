@@ -63,6 +63,12 @@ export interface PwshParams {
   async?: boolean;
   jobId?: string;
   action?: "status" | "kill" | "wait";
+  /**
+   * Rebuild the persistent session for this cwd/session before running the
+   * command. Kills the old process tree (releasing file locks held by loaded
+   * assemblies, the `Add-Type` case) and starts a fresh, empty one.
+   */
+  restart?: boolean;
 }
 
 export interface PwshDetails {
@@ -84,6 +90,8 @@ export interface PwshDetails {
 }
 
 interface SessionLike {
+  readonly pid: number | undefined;
+  readonly dead: boolean;
   run(
     req: {
       code: string;
@@ -101,11 +109,35 @@ interface SessionLike {
 
 interface PwshApi {
   getOrCreate(key: string, cwd?: string): SessionLike;
+  /** Kill and rebuild the session for `key`, returning the fresh one. */
+  restart(key: string, cwd?: string): Promise<SessionLike>;
+  /** Live pid(s) of the pooled session for `key`; empty when it has none. */
+  pidFor(key: string): readonly number[];
 }
 
-/** Session key: cwd + explicit session name. */
+/** Session key: cwd + explicit session name. Both must be newline-free (see below). */
 export function buildSessionKey(cwd: string, session?: string): string {
   return `${cwd}\n${session ?? ""}`;
+}
+
+/**
+ * Control characters that must never reach the `\n`-joined pool key: a newline
+ * in `cwd` or `session` makes `(a, "b\nc")` and `("a\nb", "c")` collide onto one
+ * process (`buildSessionKey`), silently sharing its variables, modules, and
+ * location. Reject rather than escape — escaping would mangle every Windows path
+ * and a session name has no legitimate control characters.
+ */
+const SESSION_KEY_CONTROL_RE = /[\x00-\x1F\x7F]/;
+
+/** Reason `cwd`/`session` cannot form a distinct pool key, or undefined when clean. */
+function sessionKeyInputError(cwd: string, session?: string): string | undefined {
+  if (SESSION_KEY_CONTROL_RE.test(cwd)) {
+    return `cwd may not contain control characters: ${JSON.stringify(cwd)}`;
+  }
+  if (session !== undefined && SESSION_KEY_CONTROL_RE.test(session)) {
+    return `session may not contain control characters: ${JSON.stringify(session)}`;
+  }
+  return undefined;
 }
 
 type PwshUpdate = {
@@ -141,7 +173,10 @@ export async function runPwsh(
   signal?: AbortSignal,
 ): Promise<{ text: string; details: PwshDetails; isError?: boolean }> {
   const cwd = params.cwd ?? process.cwd();
-  if (!params.command) {
+  const command = params.command;
+  // A restart stands on its own: with a command it rebuilds the session first,
+  // without one it only rebuilds (the caller just needs the locks dropped).
+  if (!command && !params.restart) {
     const error = "Missing command to execute.";
     return {
       text: error,
@@ -149,13 +184,22 @@ export async function runPwsh(
       isError: true,
     };
   }
+  // Every session-key use flows through here (foreground and restart-only); the
+  // async path keys off its job id, so it is not guarded. Fail before spawning.
+  const keyError = sessionKeyInputError(cwd, params.session);
+  if (keyError) {
+    return {
+      text: keyError,
+      details: emptyDetails(params, cwd, keyError),
+      isError: true,
+    };
+  }
   const started = Date.now();
-  const command = params.command;
   onUpdate?.({
     content: [
       {
         type: "text",
-        text: `[pwsh] running in session ${buildSessionKey(cwd, params.session)}…`,
+        text: `[pwsh] ${params.restart ? "restarting" : "running in"} session ${buildSessionKey(cwd, params.session)}…`,
       },
     ],
   });
@@ -180,7 +224,53 @@ export async function runPwsh(
   const width = normalizeWidth(params.width);
   const format = params.format === "json" ? "json" : "text";
   const sessionKey = buildSessionKey(cwd, params.session);
-  const session = api.getOrCreate(sessionKey, cwd);
+  const details: PwshDetails = {
+    cwd,
+    sessionKey,
+    format,
+    timeoutSec,
+    wallTimeMs: 0,
+  };
+
+  let previousPid: number | undefined;
+  let session: SessionLike;
+  if (params.restart) {
+    previousPid = api.pidFor(sessionKey)[0];
+    session = await api.restart(sessionKey, cwd);
+  } else {
+    session = api.getOrCreate(sessionKey, cwd);
+  }
+
+  // Restart-only call, under the same truthiness test as the guard above: with
+  // no command there is nothing left to report but the process swap.
+  if (!command) {
+    details.wallTimeMs = Date.now() - started;
+    const label = params.session
+      ? `session '${params.session}'`
+      : `session for ${cwd}`;
+    if (session.dead || session.pid == null) {
+      const error = "the fresh pwsh process did not start";
+      details.dead = true;
+      details.error = error;
+      return {
+        text: `Restarted ${label}, but ${error}.`,
+        details,
+        isError: true,
+      };
+    }
+    const transition =
+      previousPid == null
+        ? `pid ${session.pid}`
+        : `pid ${previousPid} → ${session.pid}`;
+    const reset = previousPid == null
+      ? "Session state (variables, modules, location) was reset."
+      : "Session state (variables, modules, location) was reset and any file lock held by the old process was released.";
+    return {
+      text: `Restarted ${label} (${transition}). ${reset}`,
+      details,
+    };
+  }
+
   let streamPreview = "";
 
   const runResult = await session.run(
@@ -217,13 +307,7 @@ export async function runPwsh(
   );
 
   const wallTimeMs = Date.now() - started;
-  const details: PwshDetails = {
-    cwd,
-    sessionKey,
-    format,
-    timeoutSec,
-    wallTimeMs,
-  };
+  details.wallTimeMs = wallTimeMs;
 
   if (runResult.busy) {
     return {
@@ -287,6 +371,13 @@ export async function runPwsh(
     body = "(no output)";
   }
   const notices: string[] = [];
+  if (params.restart) {
+    notices.push(
+      previousPid == null
+        ? `Session restarted (pid ${session.pid})`
+        : `Session restarted (pid ${previousPid} → ${session.pid})`,
+    );
+  }
   if (resp?.exitCode !== null && resp?.exitCode !== undefined) {
     notices.push(`Exit code: ${resp.exitCode}`);
   }
@@ -497,7 +588,7 @@ export function definePwshTool(pi: ExtensionAPI) {
     name: "pwsh",
     label: TOOL_LABEL,
     description:
-      "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats.",
+      "Execute commands in a persistent PowerShell 7 session. Modules/variables/cwd persist across calls (Import-Module is paid once). Supports text (Out-String) and JSON (ConvertTo-Json) output formats. Set restart:true to rebuild the session first (drops its state and releases file locks held by loaded assemblies).",
     // 常驻顶层 schema：避免工具被藏进 xd:// 设备目录，模型可直接调用。
     loadMode: "essential" as const,
     // Merge call+result into one frame like built-in tools: the pending call
@@ -562,6 +653,12 @@ export function definePwshTool(pi: ExtensionAPI) {
         .string()
         .optional()
         .describe("custom session name to isolate the process pool"),
+      restart: z
+        .boolean()
+        .optional()
+        .describe(
+          "restart the persistent session for this cwd/session: the old pwsh process tree is killed - releasing file locks held by loaded assemblies (e.g. an Add-Type output file) and aborting any command still running on that session - and a fresh empty one starts; with command the command then runs in the fresh session, without one the call only restarts",
+        ),
     }),
     async execute(
       toolCallId: string,
@@ -575,6 +672,12 @@ export function definePwshTool(pi: ExtensionAPI) {
       const pool = getPool();
       const jm = getJobManager(pi, ctx);
       const cwd = params.cwd ?? process.cwd();
+
+      if (params.restart && (params.action || params.jobId || params.async)) {
+        const err =
+          "'restart' rebuilds the persistent session and cannot be combined with 'action', 'jobId', or 'async'.";
+        return toolText(err, emptyDetails(params, cwd, err), true);
+      }
 
       if (params.action && !params.jobId) {
         const err = `Missing jobId for action '${params.action}'.`;

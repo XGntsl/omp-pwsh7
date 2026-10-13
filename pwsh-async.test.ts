@@ -1,7 +1,12 @@
 import { expect, test } from "bun:test";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { definePwshTool, getJobManager, resetJobManager } from "./pwsh-tool";
-import { MAX_RETAINED_SETTLED_JOBS, PwshJobManager } from "./job";
+import {
+  MAX_RETAINED_SETTLED_JOBS,
+  PwshJobManager,
+  jobLabel,
+  type PwshJob,
+} from "./job";
 import type { PwshSessionPool } from "./session";
 
 // Mock schema builder similar to zod
@@ -142,6 +147,29 @@ test("schema accepts async, jobId, and action parameters", () => {
   expect(shape.async).toBeDefined();
   expect(shape.jobId).toBeDefined();
   expect(shape.action).toBeDefined();
+  expect(shape.restart).toBeDefined();
+});
+
+test("rejects restart combined with job parameters", async () => {
+  const { tool } = makeTool();
+
+  const withAsync = await tool.execute(
+    "call_restart_async",
+    { command: "Write-Output 'x'", restart: true, async: true },
+    undefined,
+    undefined,
+  );
+  expect(withAsync.isError).toBe(true);
+  expect(withAsync.content[0]?.text).toContain("cannot be combined");
+
+  const withJobId = await tool.execute(
+    "call_restart_job",
+    { restart: true, jobId: "job_1", action: "kill" },
+    undefined,
+    undefined,
+  );
+  expect(withJobId.isError).toBe(true);
+  expect(withJobId.content[0]?.text).toContain("cannot be combined");
 });
 
 test("starts an async job immediately without blocking and delivers result via sendMessage", async () => {
@@ -934,4 +962,31 @@ test("a subagent context cannot hijack the footer slot from the interactive sess
 
   await getJobManager().getJob(jobId)?.settled;
   expect(ui.statuses.at(-1)).toEqual(["pwsh-jobs", undefined]);
+});
+
+test("job labels strip terminal control sequences before they reach the UI", () => {
+  // The label is drawn in the `/pwsh` notice and the host jobs sheet, neither of
+  // which runs the card's sanitizer — an OSC 52 sequence in a command's first
+  // line must not survive to the terminal.
+  const job = {
+    id: "pwsh_x",
+    command: "Get-ChildItem \x1b]52;c;payload\x07",
+    intent: undefined,
+    resolveIntent: undefined,
+  } as unknown as PwshJob;
+
+  const label = jobLabel(job);
+  expect(label).not.toContain("\x1b");
+  expect(label).not.toContain("\x07");
+  expect(label).toContain("Get-ChildItem");
+});
+
+test("job labels strip control sequences from a declared intent too", () => {
+  const job = {
+    id: "pwsh_y",
+    command: "whatever",
+    intent: "Do\x1b[31mthing",
+  } as unknown as PwshJob;
+
+  expect(jobLabel(job)).toBe("Dothing");
 });

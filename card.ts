@@ -8,6 +8,7 @@
  */
 import { formatToolWorkingDirectory } from "@oh-my-pi/pi-tui/render";
 import type { PwshDetails } from "./pwsh-tool";
+import { sanitizeTerminalText } from "./sanitize";
 import { highlightPowerShell } from "./syntax";
 
 export interface Theme {
@@ -45,33 +46,6 @@ function codePointWidth(char: string): number {
  */
 function visibleLength(text: string): number {
   return Bun.stringWidth(text, { countAnsiEscapeCodes: false });
-}
-
-/**
- * C0/C1 controls (ESC included) minus tab and newline. Mirrors the host's
- * `sanitizeText` (`@oh-my-pi/pi-utils`): tab and newline are structure the card
- * re-wraps itself, everything else a terminal would interpret is dropped.
- */
-const TERMINAL_CONTROL_RE = /[\x00-\x08\x0B-\x1F\x7F-\x9F]/g;
-
-/**
- * Strip terminal control sequences from untrusted text: the model's intent /
- * jobId / cwd, command output, script errors.
- *
- * The card is this tool's only sanitization point. The host renders custom
- * renderer rows verbatim (`SafeToolRendererComponent.render` returns them
- * unchanged, `chat/tool-execution.ts`), so an OSC 52 clipboard sequence in a
- * job's output would otherwise be written straight to the user's terminal.
- *
- * Call it on *raw* text only: the theme colors and Shiki highlights composed
- * afterwards are ours and must survive (sanitizing a composed row would strip
- * the card's own styling).
- */
-function sanitizeTerminalText(text: string): string {
-  TERMINAL_CONTROL_RE.lastIndex = 0;
-  if (TERMINAL_CONTROL_RE.exec(text) === null) return text;
-  TERMINAL_CONTROL_RE.lastIndex = 0;
-  return Bun.stripANSI(text).replace(TERMINAL_CONTROL_RE, "");
 }
 
 /**

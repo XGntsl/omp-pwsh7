@@ -59,6 +59,8 @@ function resolvePwshExecutable(envPath?: string): string {
 }
 
 const KILL_GRACE_MS = 1500;
+/** Reason handed to requests still in flight when the session is disposed. */
+const DISPOSE_REASON = "session killed - the in-flight command was aborted";
 /** Give up waiting for an in-flight command on the same session after this. */
 const BUSY_WAIT_TIMEOUT_MS = 30_000;
 /** Keep the last N chars of runner stderr for diagnostics. */
@@ -93,6 +95,8 @@ export class PwshSession {
   #nextId = 1 + ((Math.random() * 0x7ffffffe) | 0);
   #inFlight = false;
   #lastError: string | undefined;
+  /** Set by dispose(); reported to requests it settles, cleared on restart. */
+  #disposeReason: string | undefined;
   #stderrTail = "";
 
   constructor(
@@ -145,6 +149,7 @@ export class PwshSession {
     }
     this.#proc = proc;
     this.#dead = false;
+    this.#disposeReason = undefined;
     // Bun's onStdout/onStderr spawn options never fire (Bun 1.3.14,
     // Windows) - read the piped streams manually instead.
     if (proc.stdout)
@@ -331,7 +336,11 @@ export class PwshSession {
       settled = true;
       clearTimeout(timeoutTimer);
       this.#pending.delete(id);
-      resolveResult({ dead: true, partialOutput: this.#latestOutput });
+      resolveResult({
+        dead: true,
+        error: this.#disposeReason,
+        partialOutput: this.#latestOutput,
+      });
     };
     offExit = this.#addExitHandler(onExit);
 
@@ -400,6 +409,14 @@ export class PwshSession {
   /** Dispose: kill the process tree and drop the session. */
   async dispose(): Promise<void> {
     const live = this.#proc;
+    // Settle anything in flight *before* dropping #proc: start()'s exit handler
+    // ignores exits from a superseded process, so requests left in #pending
+    // would otherwise hang until their own deadline and report a timeout
+    // instead of the kill that actually ended them.
+    this.#dead = true;
+    this.#disposeReason = DISPOSE_REASON;
+    this.#emitExit();
+    this.#rejectAll(new Error(DISPOSE_REASON));
     this.#proc = null;
     if (live && live.pid != null && !live.killed) {
       const killer = Bun.spawn(
@@ -437,6 +454,34 @@ export class PwshSessionPool {
       session = new PwshSession(key, this.#pwshPath, this.#runnerPath, cwd);
       this.#sessions.set(key, session);
     }
+    return session;
+  }
+
+  /**
+   * Kill the pooled session for `key` and install a started, empty one under
+   * the same key. The old process tree dies first (awaited), so anything it
+   * held - most visibly a file lock from an assembly `Add-Type` loaded - is
+   * released before the caller's next command runs.
+   */
+  async restart(key: string, cwd?: string): Promise<PwshSession> {
+    const previous = this.#sessions.get(key);
+    if (previous) {
+      // Drop it from the pool before the await: a command arriving mid-restart
+      // must not grab the dying session.
+      this.#sessions.delete(key);
+      await previous.dispose();
+    }
+    // A caller that arrived during the kill awaited above installs a fresh
+    // session of its own; adopt that one instead of overwriting it, which would
+    // orphan its process outside the pool (nothing left to dispose it).
+    const raced = this.#sessions.get(key);
+    if (raced && !raced.dead) {
+      raced.start();
+      return raced;
+    }
+    const session = new PwshSession(key, this.#pwshPath, this.#runnerPath, cwd);
+    this.#sessions.set(key, session);
+    session.start();
     return session;
   }
   dispose(key: string): void {

@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { isFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
-import { definePwshTool, runPwsh } from "./pwsh-tool";
+import { buildSessionKey, definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 import { getHighlighterInstance, highlightPowerShell } from "./syntax";
 
@@ -178,6 +181,7 @@ test("uses normal optional property names in the public tool schema", () => {
     "width",
     "timeout",
     "session",
+    "restart",
   ]);
 });
 test("defines env as a dynamic string record", () => {
@@ -536,6 +540,184 @@ test("preserves session state after a streamed command", async () => {
     );
 
     expect(result.response?.output?.trim()).toBe("42");
+  } finally {
+    pool.disposeAll();
+  }
+});
+
+test("restart swaps the process and drops the session's state", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  try {
+    const cwd = process.cwd();
+    const session = `restart-state-${Date.now()}`;
+    const key = buildSessionKey(cwd, session);
+    await runPwsh(
+      { command: "$restartMarker = 'kept'", session, cwd },
+      pool,
+    );
+    const oldPid = pool.pidFor(key)[0];
+    expect(oldPid).toBeGreaterThan(0);
+
+    const result = await runPwsh(
+      {
+        command: "if ($restartMarker) { 'kept' } else { 'gone' }",
+        session,
+        cwd,
+        restart: true,
+      },
+      pool,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("gone");
+    expect(result.text).toContain(`Session restarted (pid ${oldPid} →`);
+    const newPid = pool.pidFor(key)[0];
+    expect(newPid).toBeGreaterThan(0);
+    expect(newPid).not.toBe(oldPid);
+  } finally {
+    pool.disposeAll();
+  }
+});
+
+test("a restart with no command only swaps the process", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  try {
+    const cwd = process.cwd();
+    const session = `restart-bare-${Date.now()}`;
+    const key = buildSessionKey(cwd, session);
+    await runPwsh({ command: "Write-Output 'primed'", session, cwd }, pool);
+    const oldPid = pool.pidFor(key)[0];
+    expect(oldPid).toBeGreaterThan(0);
+
+    const result = await runPwsh({ session, cwd, restart: true }, pool);
+
+    expect(result.isError).toBeUndefined();
+    const newPid = pool.pidFor(key)[0];
+    expect(newPid).toBeGreaterThan(0);
+    expect(newPid).not.toBe(oldPid);
+    expect(result.text).toContain(`pid ${oldPid} → ${newPid}`);
+  } finally {
+    pool.disposeAll();
+  }
+});
+
+test("restart releases a file the old process still holds open", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-pwsh-restart-"));
+  const locked = path.join(dir, "locked.bin");
+  try {
+    const cwd = process.cwd();
+    const session = `restart-lock-${Date.now()}`;
+    // A handle opened with FileShare.None keeps the file undeletable for as long
+    // as the session lives - the shape of the Add-Type lock that motivated
+    // `restart`, minus the assembly compile.
+    const opened = await runPwsh(
+      {
+        command: [
+          `$restartLock = [System.IO.File]::Open('${locked}', [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)`,
+          `Remove-Item -LiteralPath '${locked}' -Force -ErrorAction SilentlyContinue`,
+          `Test-Path -LiteralPath '${locked}'`,
+        ].join("; "),
+        session,
+        cwd,
+      },
+      pool,
+    );
+    expect(opened.text).toContain("True");
+
+    const released = await runPwsh(
+      {
+        command: `Remove-Item -LiteralPath '${locked}' -Force -ErrorAction SilentlyContinue; Test-Path -LiteralPath '${locked}'`,
+        session,
+        cwd,
+        restart: true,
+      },
+      pool,
+    );
+
+    expect(released.text).toContain("False");
+  } finally {
+    pool.disposeAll();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a restart adopts a session created while the old one was dying", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  try {
+    const cwd = process.cwd();
+    const session = `restart-race-${Date.now()}`;
+    const key = buildSessionKey(cwd, session);
+    await runPwsh({ command: "$raced = 1", session, cwd }, pool);
+
+    // `restart` drops the key and then awaits the kill; a caller arriving in
+    // that window installs a session of its own. Overwriting it would orphan
+    // its process outside the pool.
+    const restarting = pool.restart(key, cwd);
+    const raced = pool.getOrCreate(key, cwd);
+    const restarted = await restarting;
+
+    expect(restarted).toBe(raced);
+    const adoptedPid = restarted.pid ?? 0;
+    expect(adoptedPid).toBeGreaterThan(0);
+    expect(pool.pidFor(key)).toEqual([adoptedPid]);
+  } finally {
+    pool.disposeAll();
+  }
+});
+
+test("a restart fails the command it killed instead of timing it out", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  try {
+    const cwd = process.cwd();
+    const session = `restart-inflight-${Date.now()}`;
+    const key = buildSessionKey(cwd, session);
+    const live = pool.getOrCreate(key, cwd);
+    await live.run({ code: "Write-Output 'primed'" }, {});
+
+    // run() registers the request synchronously, so busy is already true here:
+    // no timer is needed to know the command is in flight.
+    const inflight = live.run(
+      { code: "Start-Sleep -Seconds 30" },
+      { timeoutMs: 10_000 },
+    );
+    expect(live.busy).toBe(true);
+
+    await runPwsh({ session, cwd, restart: true }, pool);
+
+    const killed = await inflight;
+    expect(killed.dead).toBe(true);
+    expect(killed.timedOut).toBeUndefined();
+    expect(killed.error).toContain("session killed");
+  } finally {
+    pool.disposeAll();
+  }
+});
+
+test("a restart reports a fresh process that failed to start", async () => {
+  const pool = new PwshSessionPool({
+    pwshPath: "C:/definitely/not/pwsh.exe",
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  try {
+    const result = await runPwsh(
+      { session: `restart-nostart-${Date.now()}`, cwd: process.cwd(), restart: true },
+      pool,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("did not start");
+    expect(result.details.dead).toBe(true);
   } finally {
     pool.disposeAll();
   }
@@ -1108,4 +1290,25 @@ test("renderCall survives a non-string intent from the streamed args", () => {
 
   expect(pending.join("\n")).toContain("PowerShell 7");
   expect(complete.join("\n")).toContain("PowerShell 7");
+});
+
+test("rejects a session name whose control characters could alias another pool key", async () => {
+  // `buildSessionKey` joins cwd and session with "\n", so `("a\nb", "c")` and
+  // `("a", "b\nc")` would otherwise collide onto one process and share its state.
+  const pool = {
+    getOrCreate: () => {
+      throw new Error("pool touched for an invalid session key");
+    },
+    restart: async () => {
+      throw new Error("pool touched for an invalid session key");
+    },
+    pidFor: () => [] as number[],
+  };
+  const result = await runPwsh(
+    { command: "Write-Output 1", session: "a\nb", cwd: process.cwd() },
+    pool as never,
+  );
+
+  expect(result.isError).toBe(true);
+  expect(result.text).toContain("control characters");
 });

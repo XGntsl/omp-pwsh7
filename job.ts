@@ -7,6 +7,7 @@
  * to wake the model without polling.
  */
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { sanitizeTerminalText } from "./sanitize";
 import type { PwshRunResult, PwshSessionPool } from "./session";
 
 /** Maximum output characters retained in-memory per background job (1 MB tail window). */
@@ -240,8 +241,11 @@ function formatJobDuration(ms: number): string {
 /** Display label for one job: the declared intent, else its first command line. */
 export function jobLabel(job: PwshJob): string {
   const declared = job.intent?.trim() || job.resolveIntent?.()?.trim();
-  if (declared) return declared;
-  return job.command.split("\n", 1)[0]?.trim() || job.id;
+  // The intent and the command are both model-authored, and this label is drawn
+  // in the `/pwsh` notice, the host jobs sheet, and the completion card — none of
+  // which run the card's sanitizer, so strip control sequences here at the source.
+  if (declared) return sanitizeTerminalText(declared);
+  return sanitizeTerminalText(job.command.split("\n", 1)[0]?.trim() || job.id);
 }
 
 /**

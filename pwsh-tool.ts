@@ -115,9 +115,29 @@ interface PwshApi {
   pidFor(key: string): readonly number[];
 }
 
-/** Session key: cwd + explicit session name. */
+/** Session key: cwd + explicit session name. Both must be newline-free (see below). */
 export function buildSessionKey(cwd: string, session?: string): string {
   return `${cwd}\n${session ?? ""}`;
+}
+
+/**
+ * Control characters that must never reach the `\n`-joined pool key: a newline
+ * in `cwd` or `session` makes `(a, "b\nc")` and `("a\nb", "c")` collide onto one
+ * process (`buildSessionKey`), silently sharing its variables, modules, and
+ * location. Reject rather than escape — escaping would mangle every Windows path
+ * and a session name has no legitimate control characters.
+ */
+const SESSION_KEY_CONTROL_RE = /[\x00-\x1F\x7F]/;
+
+/** Reason `cwd`/`session` cannot form a distinct pool key, or undefined when clean. */
+function sessionKeyInputError(cwd: string, session?: string): string | undefined {
+  if (SESSION_KEY_CONTROL_RE.test(cwd)) {
+    return `cwd may not contain control characters: ${JSON.stringify(cwd)}`;
+  }
+  if (session !== undefined && SESSION_KEY_CONTROL_RE.test(session)) {
+    return `session may not contain control characters: ${JSON.stringify(session)}`;
+  }
+  return undefined;
 }
 
 type PwshUpdate = {
@@ -161,6 +181,16 @@ export async function runPwsh(
     return {
       text: error,
       details: emptyDetails(params, cwd, error),
+      isError: true,
+    };
+  }
+  // Every session-key use flows through here (foreground and restart-only); the
+  // async path keys off its job id, so it is not guarded. Fail before spawning.
+  const keyError = sessionKeyInputError(cwd, params.session);
+  if (keyError) {
+    return {
+      text: keyError,
+      details: emptyDetails(params, cwd, keyError),
       isError: true,
     };
   }

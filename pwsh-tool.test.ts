@@ -1291,3 +1291,24 @@ test("renderCall survives a non-string intent from the streamed args", () => {
   expect(pending.join("\n")).toContain("PowerShell 7");
   expect(complete.join("\n")).toContain("PowerShell 7");
 });
+
+test("rejects a session name whose control characters could alias another pool key", async () => {
+  // `buildSessionKey` joins cwd and session with "\n", so `("a\nb", "c")` and
+  // `("a", "b\nc")` would otherwise collide onto one process and share its state.
+  const pool = {
+    getOrCreate: () => {
+      throw new Error("pool touched for an invalid session key");
+    },
+    restart: async () => {
+      throw new Error("pool touched for an invalid session key");
+    },
+    pidFor: () => [] as number[],
+  };
+  const result = await runPwsh(
+    { command: "Write-Output 1", session: "a\nb", cwd: process.cwd() },
+    pool as never,
+  );
+
+  expect(result.isError).toBe(true);
+  expect(result.text).toContain("control characters");
+});

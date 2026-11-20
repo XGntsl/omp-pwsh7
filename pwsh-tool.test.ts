@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +7,11 @@ import { isFramedBlockComponent } from "@oh-my-pi/pi-tui/render";
 import { buildSessionKey, definePwshTool, runPwsh } from "./pwsh-tool";
 import { PwshSessionPool } from "./session";
 import { getHighlighterInstance, highlightPowerShell } from "./syntax";
+
+// Every test here drives a real `pwsh` process; a restart case is a spawn, a
+// taskkill (1.5s grace) and another spawn, which overruns bun's 5s default on a
+// busy machine while asserting nothing extra about speed.
+setDefaultTimeout(30_000);
 
 const schema = () => ({
   describe() {
@@ -75,7 +80,9 @@ const theme = {
 function renderCommand(command: string, width: number): string[] {
   const tool = definePwshTool({ zod: zStub } as never);
   // Frame assertions describe the completed-args state; the pending row is covered separately.
-  return tool.renderCall({ command }, { argsComplete: true }, theme).render(width);
+  return tool
+    .renderCall({ command }, { argsComplete: true }, theme)
+    .render(width);
 }
 
 test("renders the complete long command instead of replacing its tail with an ellipsis", () => {
@@ -553,10 +560,7 @@ test("restart swaps the process and drops the session's state", async () => {
     const cwd = process.cwd();
     const session = `restart-state-${Date.now()}`;
     const key = buildSessionKey(cwd, session);
-    await runPwsh(
-      { command: "$restartMarker = 'kept'", session, cwd },
-      pool,
-    );
+    await runPwsh({ command: "$restartMarker = 'kept'", session, cwd }, pool);
     const oldPid = pool.pidFor(key)[0];
     expect(oldPid).toBeGreaterThan(0);
 
@@ -711,7 +715,11 @@ test("a restart reports a fresh process that failed to start", async () => {
   });
   try {
     const result = await runPwsh(
-      { session: `restart-nostart-${Date.now()}`, cwd: process.cwd(), restart: true },
+      {
+        session: `restart-nostart-${Date.now()}`,
+        cwd: process.cwd(),
+        restart: true,
+      },
       pool,
     );
 
@@ -746,6 +754,163 @@ test("returns streamed output when a command times out", async () => {
     expect(result.timedOut).toBe(true);
     expect(result.partialOutput).toContain("before-timeout");
   } finally {
+    pool.disposeAll();
+  }
+});
+
+/**
+ * Liveness by pid through `tasklist`: a dead pid matches no row. Real OS
+ * processes, so this is the one place a bounded wait is unavoidable —
+ * `taskkill` reports success once the target is terminated, but nothing exposes
+ * an event for a pid the extension no longer owns.
+ */
+async function pidAlive(pid: number): Promise<boolean> {
+  const proc = Bun.spawn(["tasklist", "/FI", `PID eq ${pid}`, "/NH"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+    windowsHide: true,
+  });
+  const out = await new Response(proc.stdout).text();
+  await proc.exited;
+  return out.includes(String(pid));
+}
+
+async function waitForPid(
+  pid: number,
+  alive: boolean,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if ((await pidAlive(pid)) === alive) return true;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(100);
+  }
+}
+
+/** Kill a test-started child so a failing assertion cannot leak a process. */
+async function killPid(pid: number): Promise<void> {
+  const proc = Bun.spawn(["taskkill", "/PID", String(pid), "/T", "/F"], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    windowsHide: true,
+  });
+  await proc.exited;
+}
+
+const START_SLEEPER =
+  "Start-Process pwsh -ArgumentList '-NoProfile','-Command','Start-Sleep 45' -PassThru -WindowStyle Hidden";
+
+test("disposing without a tree retires the runner and detaches its children", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const session = pool.getOrCreate(
+      `detach-dispose-${Date.now()}`,
+      process.cwd(),
+    );
+    const res = await session.run(
+      {
+        code: `$p = ${START_SLEEPER}; "runner=$PID child=$($p.Id)"`,
+      },
+      { timeoutMs: 30_000 },
+    );
+    const [, runnerPid, parsed] =
+      /runner=(\d+) child=(\d+)/.exec(res.response?.output ?? "") ?? [];
+    childPid = Number(parsed);
+    expect(childPid).toBeGreaterThan(0);
+
+    // `dispose` settles the runner, so the runner is checked without a wait;
+    // the child is what must still be there afterwards.
+    await session.dispose({ tree: false });
+    expect(await pidAlive(Number(runnerPid))).toBe(false);
+    expect(await pidAlive(childPid)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
+test("the default dispose still kills a Start-Process child", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const session = pool.getOrCreate(
+      `tree-dispose-${Date.now()}`,
+      process.cwd(),
+    );
+    const res = await session.run(
+      { code: `(${START_SLEEPER}).Id` },
+      { timeoutMs: 30_000 },
+    );
+    childPid = Number(res.response?.output?.trim());
+    expect(childPid).toBeGreaterThan(0);
+
+    // Cancel, restart, and shutdown all take the tree: the child dies with it.
+    await session.dispose();
+    expect(await waitForPid(childPid, false)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
+test("a timeout cancels the whole tree, detached child included", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const session = pool.getOrCreate(
+      `timeout-tree-${Date.now()}`,
+      process.cwd(),
+    );
+    const res = await session.run(
+      { code: `$p = ${START_SLEEPER}; "child=$($p.Id)"; Start-Sleep 30` },
+      { timeoutMs: 3_000 },
+    );
+    childPid = Number(/child=(\d+)/.exec(res.partialOutput ?? "")?.[1]);
+    expect(res.timedOut).toBe(true);
+    expect(childPid).toBeGreaterThan(0);
+
+    // Detachment only applies to commands that finished: a cancel still takes
+    // the tree, so nothing a timed-out command started survives it.
+    expect(await waitForPid(childPid, false)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
+    pool.disposeAll();
+  }
+});
+
+test("a finished stateless call leaves its Start-Process child running", async () => {
+  const pool = new PwshSessionPool({
+    runnerPath: `${import.meta.dir}/runner.ps1`,
+  });
+  let childPid = 0;
+  try {
+    const result = await runPwsh(
+      { command: `$p = ${START_SLEEPER}; "child=$($p.Id)"` },
+      pool,
+      undefined,
+      undefined,
+      { enabled: true, thresholdMs: 60_000 },
+    );
+    childPid = Number(/child=(\d+)/.exec(result.text)?.[1]);
+    expect(result.isError ?? false).toBe(false);
+    expect(childPid).toBeGreaterThan(0);
+
+    // The call retired its runner (the pool entry is gone) but the detached
+    // child is alive — the bash `&` contract.
+    expect(pool.pidFor(result.details.sessionKey)).toEqual([]);
+    expect(await pidAlive(childPid)).toBe(true);
+  } finally {
+    if (childPid > 0) await killPid(childPid);
     pool.disposeAll();
   }
 });
@@ -1012,7 +1177,11 @@ test("a multi-line intent cannot split a card row", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const intent = "List\nlarge files";
   const pending = tool
-    .renderCall({ i: intent, command: "Get-Chil" }, { argsComplete: false }, theme)
+    .renderCall(
+      { i: intent, command: "Get-Chil" },
+      { argsComplete: false },
+      theme,
+    )
     .render(60);
   const settled = tool
     .renderResult(
@@ -1046,7 +1215,9 @@ test("renderCall shows a working directory only when the call asked for one", ()
   const render = (cwd?: string) =>
     tool
       .renderCall(
-        cwd === undefined ? { command: "Get-Date" } : { command: "Get-Date", cwd },
+        cwd === undefined
+          ? { command: "Get-Date" }
+          : { command: "Get-Date", cwd },
         { argsComplete: true },
         theme,
       )
@@ -1091,12 +1262,10 @@ test("renderResult titles the merged card with the intent and no cwd the call di
     output: "42\n",
   };
   const rendered = tool
-    .renderResult(
-      { details },
-      { expanded: false },
-      theme,
-      { i: "Read a missing path", command: "Get-Date" },
-    )
+    .renderResult({ details }, { expanded: false }, theme, {
+      i: "Read a missing path",
+      command: "Get-Date",
+    })
     .render(120)
     .join("\n");
 
@@ -1169,12 +1338,7 @@ test("titles a card the streamed call never saw, from the execution-start intent
     intent: "List every file",
   });
   const merged = tool
-    .renderResult(
-      { details: mergedDetails },
-      { expanded: false },
-      theme,
-      args,
-    )
+    .renderResult({ details: mergedDetails }, { expanded: false }, theme, args)
     .render(100)
     .join("\n");
 
@@ -1202,12 +1366,9 @@ test("flattens a host-recorded intent so it cannot split the card row", () => {
 test("falls back to the tool label when no intent was ever declared or recorded", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const merged = tool
-    .renderResult(
-      { details: mergedDetails },
-      { expanded: false },
-      theme,
-      { command: "Get-ChildItem" },
-    )
+    .renderResult({ details: mergedDetails }, { expanded: false }, theme, {
+      command: "Get-ChildItem",
+    })
     .render(100)
     .join("\n");
 
@@ -1243,10 +1404,16 @@ test("every frame row occupies the same number of columns", () => {
     `${"x".repeat(200)}\nemoji 🐈 mid-line ${"y".repeat(40)}\n`,
   ];
   const cases = [
-    ...payloads.map((output) => ({ output, intent: undefined as string | undefined })),
+    ...payloads.map((output) => ({
+      output,
+      intent: undefined as string | undefined,
+    })),
     // A model-authored intent longer than the frame is the case that used to
     // floor `frameTop`'s fill at 0 and push the top bar past the right corner.
-    { output: payloads[0]!, intent: "Explain why the deployment script keeps failing ".repeat(3) },
+    {
+      output: payloads[0]!,
+      intent: "Explain why the deployment script keeps failing ".repeat(3),
+    },
   ];
   // 40 columns is narrower than the status label (`✓ completed · Wall: … |
   // Timeout: 120s`), which is what made the divider row overflow.
@@ -1270,7 +1437,9 @@ test("every frame row occupies the same number of columns", () => {
           { i: intent, command: "Get-Date" },
         )
         .render(width);
-      const widths = rows.map((row) => Bun.stringWidth(row, { countAnsiEscapeCodes: false }));
+      const widths = rows.map((row) =>
+        Bun.stringWidth(row, { countAnsiEscapeCodes: false }),
+      );
 
       expect(new Set(widths).size).toBe(1);
       // No row may be wider than the box the host allocated for the component.
@@ -1282,10 +1451,18 @@ test("every frame row occupies the same number of columns", () => {
 test("renderCall survives a non-string intent from the streamed args", () => {
   const tool = definePwshTool({ zod: zStub } as never);
   const pending = tool
-    .renderCall({ i: 1 as never, command: "Get-Da" }, { argsComplete: false }, theme)
+    .renderCall(
+      { i: 1 as never, command: "Get-Da" },
+      { argsComplete: false },
+      theme,
+    )
     .render(60);
   const complete = tool
-    .renderCall({ i: { text: "x" } as never, command: "Get-Date" }, { argsComplete: true }, theme)
+    .renderCall(
+      { i: { text: "x" } as never, command: "Get-Date" },
+      { argsComplete: true },
+      theme,
+    )
     .render(60);
 
   expect(pending.join("\n")).toContain("PowerShell 7");
